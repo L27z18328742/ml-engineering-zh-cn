@@ -1,0 +1,88 @@
+{
+  "repository": "https://github.com/stas00/ml-engineering",
+  "revision": "fb75494c0d9e536f048e27be2869a77fe65ad9f4",
+  "retrieved": "2026-10-10",
+  "license": "CC-BY-SA-4.0",
+  "documents": [
+    {
+      "path": "insights/ai-battlefield.md",
+      "sha256": "0fce858655b755822fcb59b662c800ca0e33fe2faaa7e2c5b4e0973be7751a10",
+      "words": 4948
+    },
+    {
+      "path": "insights/how-to-choose-cloud-provider.md",
+      "sha256": "6bac21ad96091d0e4aa8d89fe0f541d4267743c03802d478b06b9e1c3862d0af",
+      "words": 5732
+    },
+    {
+      "path": "insights/when-to-upgrade-gpus/README.md",
+      "sha256": "d31fbacdad0bde9169bf97b532fd770d538a2f5cd1cc892db85ebf4646613bd9",
+      "words": 5415
+    },
+    {
+      "path": "training/README.md",
+      "sha256": "979c16568aabf5b46120a0af1f65810319426ecf27336457e116fb6b51295bfb",
+      "words": 121
+    },
+    {
+      "path": "training/checkpoints/README.md",
+      "sha256": "6a2d57ac2feeb093d5fc43e6f6b2f2ddc1b569db7a0340b1583f3beec3d519ba",
+      "words": 71
+    },
+    {
+      "path": "training/datasets.md",
+      "sha256": "d93d69d73873d3f3995dd3ecbe4001bfd79d992eb61d69d65f577d075c6d1bc8",
+      "words": 348
+    },
+    {
+      "path": "training/dtype.md",
+      "sha256": "b21975698ddeca8ab2126afb8f0b9f04ba91f5c489a6d44d54e243aa2b8cfb15",
+      "words": 1677
+    },
+    {
+      "path": "training/emulate-multi-node.md",
+      "sha256": "d2f58c137d61b10100fae9b72b7778f21a8a0a09258dbd686176111511857e33",
+      "words": 4153
+    },
+    {
+      "path": "training/fault-tolerance/README.md",
+      "sha256": "b2b4ccb710dfdcf75d7f40182c0cf2548a7b7308c2d580c418c9728c51ee196b",
+      "words": 6461
+    },
+    {
+      "path": "training/hparams.md",
+      "sha256": "8f8ed3509399e341c10e567abde124d7231ee07c0809e11232a7ffd20b444b3a",
+      "words": 376
+    },
+    {
+      "path": "training/instabilities/README.md",
+      "sha256": "3ab7429c6c7f11cf449b09eb23678b4b920c061de5023c530170a94fd6c0e896",
+      "words": 666
+    },
+    {
+      "path": "training/instabilities/training-loss-patterns.md",
+      "sha256": "ea1199d59a62d9c6d84d19ec93c6b717e836556be20b36a975d7dd1740a8cb51",
+      "words": 1534
+    },
+    {
+      "path": "training/model-parallelism/README.md",
+      "sha256": "bd60de002f9c44424628b887799ffc17bc24b50d07c0c59ee6477388b4be7d83",
+      "words": 7983
+    },
+    {
+      "path": "training/performance/README.md",
+      "sha256": "0dc56386d5fccfc36a06b1b6c12e960676b372f9016063397a76affd08d1aa73",
+      "words": 12893
+    },
+    {
+      "path": "training/re-train-hub-models.md",
+      "sha256": "40aad6333207966c073a2e9bf1fab6498f1a4fbdc1454824cad0550ce67eced3",
+      "words": 317
+    },
+    {
+      "path": "training/reproducibility/README.md",
+      "sha256": "72b2624d4477692d761239f0a7939642bd96293ef4c98a3de67a730d3b00da00",
+      "words": 1936
+    }
+  ]
+}

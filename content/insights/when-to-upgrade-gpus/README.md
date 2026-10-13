@@ -1,0 +1,303 @@
+# 何时值得升级 GPU？
+
+本指南通过真实 DeepSpeed 训练基准，判断升级 GPU 世代是否值得：以 meta-llama/Llama-3.1-8B 为例，对比 H200 上的 FlashAttention-3 与 B200 上的 FlashAttention-4。虽然数据来自 Hopper H200 → Blackwell B200，这套方法适用于任何“是否从 GPU X 升级到 GPU Y”的决策。
+
+## H200 与 B200 的关键规格差异
+
+| 规格 | H200 SXM | B200 SXM | B200/H200 |
+| --- | --- | --- | ---: |
+| 架构 | Hopper | Blackwell | — |
+| 计算能力 | sm90 | sm100 | — |
+| 注意力内核（HF 自动选择） | FlashAttention-3 | FlashAttention-4（beta） | — |
+| bf16 理论峰值 TFLOPS | 989 | 2250 | **2.28×** |
+| fp8 理论峰值 TFLOPS | 1979 | 4500 | 2.27× |
+| HBM3e 可用容量 | ~141GiB | ~180GiB | 1.28× |
+| HBM 带宽 | 4.8TBps | 8.0TBps | 1.67× |
+| TDP | 700W | 1000W | 1.43× |
+
+理论峰值 TFLOPS 是[实践中没人能达到的上限](../../training/performance/README.md#tflops-as-a-performance-metric)。实际可达到的性能见[下面的 MAMF 数据](#mamf-the-realistic-ceiling-not-the-marketing-number)。各厂商、各数据类型、显存、功耗和频率的完整规格，参见[加速器规格表](../../compute/accelerator/README.md#tflops-comparison-table)。
+
+## MAMF：现实上限，而非营销数字
+
+**MAMF（Maximum Achievable Matmul FLOPS，最大可达矩阵乘法 FLOPS）**是在真实软硬件上测得的最佳 `matmul` 吞吐量，使用完美对齐、足够大的形状，不使用稀疏性。它区别于无法真正达到的理论峰值，可用来判断训练 TFLOPS 还有多少优化空间，还是已经接近上限。用 [`mamf-finder.py`](../../compute/accelerator/benchmarks/mamf-finder.py) 测自己的 GPU。来源及多厂商对比见 [MAMF 比较表](../../compute/accelerator/README.md#maximum-achievable-and-sustainable-matmul-flops-comparison-table)。
+
+**BF16：**
+
+| 加速器 | MAMF（TFLOPS） | 理论值 | 效率 |
+| --- | ---: | ---: | ---: |
+| H100/H200 SXM | 794.5 | 989 | 80.3% |
+| B200 SXM | 1745.0 | 2250 | 77.6% |
+
+**FP8：**
+
+| 加速器 | MAMF（TFLOPS） | 理论值 | 效率 |
+| --- | ---: | ---: | ---: |
+| H200 SXM | 1453.4 | 1979 | 73.4% |
+| B200 SXM | 3432.5 | 4500 | 76.3% |
+
+可达 bf16 比值为 1745/794.5＝**2.20×**，接近理论 2.28×，因为两者效率相近，分别为 80.3% 和 77.6%。fp8 可达比值反而高于理论值：3432.5/1453.4＝**2.36×**，因为 B200 的 fp8 路径相对更成熟，效率 76.3%，H200 为 73.4%。无论哪种格式，**这次升级单看矩阵乘法的现实上限约为 2.2–2.4×**。考虑注意力扩展、稠密 GEMM 成熟度和通信开销后，真实训练吞吐量会更低。[下面的案例](#worked-example-meta-llamallama-31-8b-training-step-fa3-vs-fa4)展示具体低多少，以及原因。
+
+## 决策框架第一部分：是否需要新的数据类型？
+
+先回答这个问题，因为它可能不经测试就决定结论。首要问题并非“快多少”，而是“新 GPU 是否能做旧 GPU **做不到**的事情？”对跨世代硬件升级，最清晰的能力差异是[新的低精度数据类型](../../training/dtype.md)。
+
+Blackwell 增加了 Hopper **完全无法在硬件上执行**的 **FP4／NVFP4／FP6**，适用于 FP4 推理或微缩放训练方案。[^unlocks] 如果目标方案需要这些格式，旧 GPU 的能力是零，而不是“慢两倍”。无需跑分，只需判断是否需要该能力。不过，它也是最受软件成熟度影响的功能：芯片可能已经支持，框架、内核和数值方案却还没跟上，参见[软件支持](#software-support-the-cost-of-switching-too-early)。
+
+**为某项功能升级前，确认实际使用的软件支持它。** 技术栈无法调用的硬件能力，买来等于浪费。规格表只说明芯片能做什么，不代表今天的框架、内核和库允许你做什么。例如：
+
+- Grace 系统的 CPU↔GPU 一致性互联 **NVLink-C2C**，纸面上很好，但刚推出时大多数训练／推理软件几乎没有利用。软件跟上之前，付钱也没多少实际收益。
+- 完全可用的 FlashAttention 4 也花了很多个月才出现。之前只能继续使用无法发挥新架构优势、在 Blackwell 上很慢的 FlashAttention 2。
+
+任何由功能驱动的升级，都应把“我的技术栈支持吗？”作为硬性门槛，并随时间重新检查。
+
+新 GPU 的其他优势——更多显存、更高带宽、更快互联、更多 FLOPS——是已有资源的数量增加，而非全新能力，不能单独决定是否升级，需要实测。这就是[第二部分](#decision-framework-part-2--is-it-worth-it-on-performance)。
+
+[^unlocks]: H200→B200 的理论 TFLOPS：bf16 989→2250，fp8 1979→4500；Hopper 不支持的 fp6 在 B200 为 4500，mxfp4、nvfp4 为 9000。FP4 相比 fp8 吞吐量约翻倍，量化张量的显存和带宽需求减半。让 4 位真正可用的是 Blackwell **支持微缩放的第二代 Transformer Engine**：FP4 只有约 16 个可表示值，每张量一个缩放因子无法覆盖动态范围，小值下溢为零，大值饱和。MX／NVFP4 改为每个小块，例如 16–32 个值，设置独立缩放因子，由 Tensor Core 在硬件中应用，不损失吞吐量。因此能在 FP4 约两倍速度、半显存下保持接近 fp8／bf16 的精度，而朴素的逐张量 FP4 做不到。Hopper 第一代 TE 通过逐张量缩放支持 fp8，Blackwell 第二代扩展到分块缩放 fp4／fp6。
+
+## 决策框架第二部分：性能收益是否值得？
+
+如果不需要[第一部分](#decision-framework-part-1--do-you-need-a-new-dtype)的新功能，升级就是用钱换速度和容量的量化问题，必须**测量**。在相信厂商幻灯片或单个跑分前，完成以下步骤：
+
+1. **两种 GPU 使用相同软件栈。**旧、新硬件上的 torch／CUDA／库版本一致。新 GPU 往往同时使用更新软件，而仅软件差异就可能带来两位数百分比提升，参见[注意事项](#caveats)。必须公平比较。
+2. **找出工作负载中注意力与稠密计算的比例，以及它随真实配置如何变化。**新 GPU 的 FlashAttention 改进通常快于稠密 GEMM 软件成熟速度，cuBLAS／cuDNN 适配新架构需要时间。长上下文等注意力占比高的负载，收益通常大于短上下文、稠密计算受限负载；这个比例还会随序列增长而改变，必须测量，不能假定。[^linear-attn]
+3. **衡量新 GPU 的显存、带宽、互联对你的工作负载有何价值。**这些是数量提升，收益取决于负载：
+   - **更多显存**，例如 180 对 141 GiB，是接近能力分界的一项。它可以容纳旧 GPU 上 OOM 的配置，免去 CPU 卸载、高 ZeRO 阶段、激活检查点等损失吞吐量的手段，重新调优后的有效加速甚至可能超过 FLOPS 比例。但“装不下”通常不是绝对障碍：增加 GPU 和 [ZeRO／TP／CP／SP／PP／EP](../../training/model-parallelism/README.md)，往往仍能装入旧硬件。因此通常是成本与效率取舍，只有额外并行带来的花费或减速超过新硬件代价，才倾向直接升级。极端情况下，负担得起的所有并行方案都装不下，显存才像新数据类型一样成为硬能力差距。
+   - **更高 HBM 带宽**，8.0 对 4.8 TBps，约 1.67×，决定归一化、逐元素运算、优化器、KV 流量等带宽受限工作，以及 decode 受限推理延迟的上限。收益取决于实际受带宽限制的程度。
+   - **更快互联**，包括新 NVLink／NVSwitch／NVLink-C2C，提高 ZeRO／TP／CP／SP／PP／EP 通信、主机内存卸载和多节点扩展上限，收益取决于通信瓶颈程度。
+4. **计算每 token 或每步成本，不只看 TFLOPS。**速度翻倍、价格也翻倍，单位成本持平；胜负取决于完成时间和显存余量。
+5. **注意会放大或缩小实验室数字的现实因素**，例如 packed／unpacked 序列、beta 内核、软件栈不一致。具体见[注意事项](#caveats)。
+
+[^linear-attn]: 新模型转向线性／混合注意力后，支撑长上下文升级收益的 O(s²) 全注意力占比正在缩小，包括 Gated DeltaNet、Mamba 风格 SSM、滑动窗口，以及在大量线性注意力层之间插入少量全注意力层的 MoE 混合架构。线性注意力为 O(s)，更接近稠密路径，而非全注意力。让新 GPU 在长上下文中显著受益的平方项，在这些模型中比经典稠密注意力 Transformer 占比更小。目标若是线性或混合架构，不要从 Llama-3 这类全注意力模型外推收益；应测具体架构，而且它的内核通常更年轻，参见[软件支持](#software-support-the-cost-of-switching-too-early)。
+
+下面用 H200→B200 的完整案例演示这些步骤。
+
+## 实例：meta-llama/Llama-3.1-8B 训练步，FA3 对比 FA4
+
+配置：meta-llama/Llama-3.1-8B，真实权重，bf16，8 块 GPU，DeepSpeed，mbs=1，前向+反向+优化器更新。使用 HF 原生 `attn_implementation` 按 GPU 自动选择：**H200→FA3，B200→FA4**。
+
+### 结果：加速随序列长度增长
+
+两种 GPU 配置相同：ZeRO-3 + 激活检查点 + CPU 卸载 + Liger-Kernel。稳态每 GPU TFLOPS 如下：
+
+| 序列长度 | 全注意力占单步比例 | H200 TFLOPS | H200 MFU | B200 TFLOPS | B200 MFU | 加速比 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8K | ~13% | 141 | 14% | 167 | 7% | **1.19×** |
+| 32K | ~36% | 324 | 33% | 524 | 23% | **1.62×** |
+| 64K | ~53% | 391 | 40% | 719 | 32% | **1.84×** |
+| 128K | ~70% | 420 | 42% | 836 | 37% | **1.99×** |
+| 192K | ~77% | 422 | 43% | 852 | 38% | **2.02×** |
+| 256K | ~82% | 419 | 42% | 852 | 38% | **2.03×** |
+
+![性能、加速比及注意力占比随序列长度变化](results_plot.png)
+
+**为什么序列越长，加速越大？** 每步因果注意力计算量为 `6·s²·d·h·L`，是 O(s²)；稠密路径为 `6·N·tok`，是 O(s)。序列越长，注意力占比越高，而 FA4／Blackwell 的优势恰好集中于此。只提升约 1.7× 的稠密路径，在这个规模下受带宽和较年轻的 sm_100 cuBLAS 限制，占比逐渐缩小。整个过程中都满足 `speedup ≈ 2.28 × MFU_ratio`。距离 2.28× 的剩余差距来自 FA4 beta 开销，即使纯注意力也尚未达到完整硬件比例。
+
+**FLOP 计数口径：**这里 TFLOPS／MFU 使用*模型* FLOPs，即 [MFU](../../training/performance/README.md#mfu-vs-hfu)，注意力按**因果**形式计算为 `6·s²·…`，对应 FlashAttention 实际计算的下三角。非因果 `12·s²` 会把注意力重复计算，夸大长上下文 MFU。激活检查点重计算被排除；若计入则为 HFU，约高 1.3×。两种口径在 B200/H200 比值中抵消，因此只影响绝对 MFU／TFLOPS，不影响主要加速比。
+
+**8K 注意事项：**这个重配置是为达到 256K 而设计，到了 8K，ZeRO-3、激活检查点和 CPU 卸载几乎都是无计算可掩盖的额外开销，导致 B200 MFU 只有个位数，加速仅 1.19×。适合 8K 的配置，即 ZeRO-2、不重计算、不卸载，可获得约 1.69× 和高得多的 MFU，见[稠密路径差距来源](#where-the-dense-path-deficit-comes-from-why-not-the-full-228)。**不要用长上下文配置跑短上下文，再把结果当作代表性结论。**
+
+### 更大 GPU 能否运行旧 GPU 无法运行的配置？
+
+配置为 ZeRO-3、Liger-Kernel、启用激活检查点和 CPU AdamW 卸载、mbs=1。激活检查点加融合交叉熵后，[激活显存](../../training/performance/README.md#anatomy-of-models-memory-usage)较小且线性增长：**峰值≈12.6 GiB + 0.00043 GiB/token**。12.6 GiB 基础开销来自 ZeRO-3 参数／梯度分片，AdamW 状态位于 CPU。
+
+同一序列长度下，两种 GPU 最差 rank 的 `max_memory_reserved` **几乎相同**，由模型、ZeRO-3 分片和激活决定，而非 GPU 架构；因此，只要未超过各自容量上限，能装入其中一者的序列也能装入另一者。
+
+| 序列长度 | H200 峰值 GiB | B200 峰值 GiB | H200 TFLOPS | B200 TFLOPS |
+| ---: | ---: | ---: | ---: | ---: |
+| 8K | 16.3 | 16.3 | 141 | 167 |
+| 32K | 25.8 | 25.9 | 324 | 524 |
+| 64K | 37.5 | 37.6 | 391 | 719 |
+| 128K | 66.5 | 66.7 | 420 | 836 |
+| 192K | 95.7 | 95.7 | 422 | 852 |
+| **256K** | **124.5** | **124.6** | **419** | **852** |
+
+H200 约 130 GiB 的可用预算下，最大达到 **256K token、约 125 GiB**。两种机器均已确认，峰值相差约 0.2 GiB 以内。B200 的 HBM 更大，180 对 141 GiB，可能超过约 350K token，这是该配置下 H200 无法容纳的序列，且恰好也是 B200 加速最大的区域。这是[第二部分](#decision-framework-part-2--is-it-worth-it-on-performance)显存优势的极端形式：超过 256K 后，比较不再只是“B200 更快”，而是“H200 无法完成这项配置”。
+
+### 注意事项
+
+1. 未打包与打包序列
+
+   上面的每次运行都输入**一条稠密序列**，是真正的 O(s²) 全注意力。因此，256K 时注意力占 FLOPs 约 82%，并产生至少 2× 加速，见[结果表](#results-speedup-grows-with-sequence-length)。真实训练经常使用文档掩码，把短样本打包，注意力开销变为 `Σ lenᵢ²`，而不是 `(Σ lenᵢ)²`。例如，将约 8K token 的样本打包成 256K 序列，注意力只在各样本内部执行，FLOPs 约下降 32 倍：从 `256k²` 变为 `256k·8k`。下降倍数等于打包长度除以平均样本长度，取决于样本有多短，而不是单看装了多少个。注意力占比因此回到真正 8K 序列的约 13%，加速回到实测的稠密路径受限区间，约 **1.7×**，而不是约 2×，详见[后文](#where-the-dense-path-deficit-comes-from-why-not-the-full-228)。至少 2× 的结果针对真正很长的*单篇文档*，使用前要确认负载属于哪种情况。
+
+2. 使用完全相同的软件栈比较
+
+   写本指南时，我最初疏忽地把 H200 的 torch **2.10.0/cu129** 与 B200 的 **2.13.0/cu130** 比较，结果明显偏向 B200。我怀疑 CUDA 版本，于是在 H200 上扫描 torch 2.10.0–2.13.0，以及 cu129、cu130，发现 CUDA 几乎不是主因。真正影响来自 **PyTorch 本身**：2.12.0 及以后明显快于 2.11.0 及以前，与 CUDA 版本无关。相同 GPU、模型、配置，8K 下结果如下：
+
+   | H200 @ 8K，TFLOPS/GPU | torch 2.10.0 | 2.11.0 | 2.12.0 | 2.13.0 |
+   | --- | --- | --- | --- | --- |
+   | **cu129** | 113.8 | – | – | 140.4 |
+   | **cu130** | 117.8 | 120.5 | 140.1 | **140.2** |
+
+   固定 cu130，torch 2.10.0→2.13.0 提升 **19%**，117.8→140.2 TFLOPS，其中几乎全部来自 2.11.0→2.12.0 的 **16%**，120.5→140.1。CUDA 最多贡献约 3.5%，即 torch 2.10.0 下 113.8→117.8；到 2.13.0 几乎没有差别，140.4 对 140.2。因此，最初 2.10.0/cu129→2.13.0/cu130 的 **23.4%** 提升，几乎全是 **PyTorch 版本效应，而非硬件，甚至不是 CUDA**。本文所有结果均使用相同 torch 2.13.0/cu130、DeepSpeed 0.19.2。**跳过此检查，就会系统性高估使用更新 PyTorch 的那块 GPU。**
+
+### B200 值得支付约两倍 H200 的价格吗？
+
+为简化，假定价差为两倍，新 GPU 系列刚推出时通常如此。原文指出 Blackwell 从 2026 年中开始供应，因此实际价差已小于两倍。
+
+实际计算应使用自己的报价，而不是网上价格。
+
+在两倍价格假设下：
+
+- **长、未打包上下文，128K–256K：**吞吐量约两倍、价格约两倍，每 token 成本持平；再加上完成时间减半，以及显存扩大带来的更长上下文能力，就有净收益，而这里也恰好是 B200 加速最大的区域。
+- **短／打包上下文：**约 1.7× 加速。该规模的稠密路径受带宽而非计算限制，参见[后文](#where-the-dense-path-deficit-comes-from-why-not-the-full-228)。不要指望仅靠 cuBLAS sm_100 成熟就达到 2.28×，它更接近 **1.67× HBM 带宽上限**。要接近 2.28×，需要更大批量或更大 GEMM，让稠密路径重新受计算限制。
+
+**除每 token 成本外，还要看时间。**单看性价比，会把单位 token 成本相同的“慢而便宜”和“快而贵”视为等价，却忽略实际得到结果的时间。
+
+- 训练耗时两倍，可能输掉抢先上市的竞赛，单位成本节省无法弥补。
+- 推理慢两倍，会直接恶化首 token 时间 TTFT 和每输出 token 时间 TPOT，可能损失用户，即使单位 token 成本很好看。
+- 理论上，可以用约两倍数量的便宜 GPU 买回速度，但会增加跨 GPU、甚至跨节点通信，开销可能吃掉乃至超过想追回的加速，通信受限负载尤其如此。原始速度优势应作为独立维度，而不是仅放在成本比值中。
+
+**本例判断：**真正长上下文训练值得升级；短／打包工作负载可以暂缓，因为该批量下稠密路径受带宽限制，无法达到完整 2.28× 硬件比例。
+
+### 稠密路径差距从何而来：为什么不是完整 2.28×？
+
+深入分析适合短上下文的 8K 训练步：ZeRO-2，不使用激活检查点。下面三项采用**同一个时间基准**：实测单步墙钟时间，再按计算 stream 上内核耗时占比分配。注意力对应 FlashAttention 内核，NCCL 梯度通信与反向重叠，隐含在墙钟时间内。因此分项按构造就能与总量对齐。使用 [`bench_decompose.py`](bench_decompose.py) 复现。
+
+**8K 单步分解**：注意力约占 FLOPs 的 13%、单步时间的 12%，其余为稠密路径。
+
+| 分项 | H200 TFLOPS | H200 MFU | B200 TFLOPS | B200 MFU | 比值 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 注意力（FA） | 447 | 45% | 834 | 37% | 1.87× |
+| 其他全部 | 463 | 47% | 771 | 34% | 1.67× |
+| **总计** | 461 | 47% | 778 | 35% | **1.69×** |
+
+两个关键现象：
+
+- **FA4 对 FA3 在真实训练步中提升 1.87×**，与独立微基准吻合。[`bench_flash_attn.py`](bench_flash_attn.py) 对 8B 注意力形状、因果前向+反向测得，8K 为 **1.88×**，32K 为 **1.95×**。注意力接近 2.28× 上限，并不是瓶颈。
+- **限制来自“其他全部”稠密路径，仅 1.67×**，几乎恰好等于 HBM 带宽比，8/4.8＝1.67。在 mbs=1×8K 下，每 GPU GEMM 较小，归一化、RoPE、SwiGLU、CE 逐元素计算、NCCL 通信和瘦矩阵 GEMM 使其受带宽与开销限制。Blackwell 2.28× 的计算优势大部分闲置，最终整体只有 **1.69×**。
+
+**Liger-Kernel** 融合 RMSNorm／RoPE／SwiGLU／CE，在 8K 下主要是**省显存，而非提速**：峰值下降约 20%，两种 GPU 都从 **99→80 GiB**；单步时间变化在噪声范围内，均不超过 1.5%，综合加速基本不变，约 1.66×。融合这些带宽受限逐元素操作没有提高吞吐量，因为限制已在 GEMM 大小和通信，而非这些操作，这与结果跟随 HBM 带宽一致。cuBLAS sm_100 比 Hopper 版本年轻，测量时 FA4 仍为 beta，此后已作为 `flash-attn-4` 包发布。因此这一差距应随时间缩小，应定期重测，不要把今天的数字当永久结论。
+
+### 实验环境
+
+| 项目 | B200 | H200 |
+| --- | --- | --- |
+| GPU | NVIDIA B200 | NVIDIA H200 |
+| 注意力 | flash-attn-4 4.0.0b22（beta） | flash-attn-3 3.0.0 |
+| PyTorch / CUDA | 2.13.0 / cu130 | 2.13.0 / cu130 |
+| deepspeed | 0.19.2 | 0.19.2 |
+| python / transformers / Liger-Kernel | 3.12.12 / 5.14.1 / 0.8.0 | 相同 |
+
+## 软件支持：过早切换的代价
+
+新芯片几乎总是早于能充分发挥其能力的软件栈出货。“GPU 能买到”和“能按额定性能运行你的负载”之间，可能相差数月，而且差距还可能因模型架构而异。本测试直接体现两种情况：
+
+1. **优化内核本身仍可能是 beta。**这里 B200 使用 `flash-attn-4 4.0.0b22`，不是正式 GA。beta 内核可能有正确性缺陷、缺少功能或破坏性 API 变更。应锁定精确版本，每次升级重测，并查看 issue；不能把“已经上 PyPI”当成生产可用。
+2. **主要内核正常，其他软件仍可能落后。**独立注意力已接近 1.9×，而稠密路径只有约 1.7×，见[上文](#where-the-dense-path-deficit-comes-from-why-not-the-full-228)。该规模受带宽和开销限制，且新 `sm_100` 的 cuBLAS 不如多年成熟的 Hopper 版本。因此，即使用最佳注意力内核，也可能只获得部分理论加速，因为那些不够吸引眼球、没人放到幻灯片上的组件还没跟上。
+
+**为新架构投入预算前的实践检查：**
+
+- 在内核库 issue 中搜索准确计算能力，例如 `sm_100`，以及模型的注意力／MoE 机制名称。README 写“支持”，不代表正式发布质量，甚至不代表有预编译 wheel。
+- 确认 DeepSpeed、Megatron-LM、TorchTitan 等框架已有针对新计算能力验证过的*发布版本*。“应该能用，反正都是 CUDA”不等于实测。
+- 模型使用线性注意力、MoE 路由、稀疏注意力或融合 CUDA 扩展时，确认确实有人在新架构上构建并测试性能。不能因为 GPU 更快，就假定算子也按比例加速。
+- 定期重测。beta 内核和年轻的 GEMM 库都在快速改进，[cuBLAS 成熟度差距](#where-the-dense-path-deficit-comes-from-why-not-the-full-228)可能几次发布就把“不值得”变成“值得”；发生回归也可能反过来。
+
+## 先租用目标硬件
+
+可以参考别人做的分析，例如本指南，但工作负载通常不同，最好测自己的实际负载。
+
+因此，建议先租至少一个目标 GPU 节点运行基准。
+
+多节点负载可以先缩小到单节点，例如减少模型层数。ML 架构通常由重复层堆叠，将 [48 层缩成 1–2 层](../../debug/pytorch.md#reducing-the-number-of-layers-for-large-models)，显存需求很低，容易装入单节点，同时仍能代表每层计算和显存行为。
+
+最终仍必须测试完整的最小模型副本配置，但可以等单节点比较显示升级有利后再租更多节点。如果单节点都不占优，就节省了额外测试的时间和金钱。
+
+## 将框架用于自己的升级决策
+
+替换为自己的模型、GPU 和价格，依次执行[第一部分](#decision-framework-part-1--do-you-need-a-new-dtype)和[第二部分](#decision-framework-part-2--is-it-worth-it-on-performance)：先检查能力，能力未决定时再衡量性能。
+
+1. 两种 GPU 锁定相同软件栈，见[注意事项](#caveats)，否则测到的是软件栈差异。
+2. 扫描会改变注意力／稠密计算，或加速／未加速部分占比的维度。LLM 训练通常是序列长度，其他任务可能是批量、分辨率等。
+3. 在旧 GPU 上扫描显存受限配置直到 OOM，检查新 GPU 还能多容纳什么。
+4. 获取实际每 GPU 小时报价，对扫描的每个点计算每 token／每步成本，而不只看最大点。
+5. 排除让比较失效的因素：beta 内核、打包数据、温度降频，以及同节点 GPU 之间的体质差异，参见[并非所有加速器都一样](../../compute/accelerator/README.md#not-all-accelerators-are-created-equal)。
+
+使用 [FSDP](../../training/model-parallelism/README.md) 扩展时，性能应该与 DeepSpeed ZeRO 大致相当，可能需要调整配置以匹配实际环境；理想情况下，当然应测试自己的完整软件。
+
+## 同一代内的升级
+
+前文比较的是 Hopper→Blackwell 两代。B200→**B300（Blackwell Ultra）**这类同代更新，是另一种通常更小的决策。仍适用[能力检查](#decision-framework-part-1--do-you-need-a-new-dtype)和[性能检查](#decision-framework-part-2--is-it-worth-it-on-performance)，但答案的变化可以预期。
+
+| 规格 | B200 SXM | B300 SXM | 比值 |
+| --- | ---: | ---: | ---: |
+| bf16 / fp8 理论 TFLOPS | 2250 / 4500 | 2250 / 4500 | 1.0× |
+| mxfp4 / nvfp4 理论 TFLOPS | 9000 / 9000 | 13500 / 13500 | 1.5× |
+| bf16 MAMF | 1745 | 1769 | ~1.01× |
+| 可用 HBM | ~180GiB | ~288GiB | **1.6×** |
+| HBM 带宽 | 8.0TBps | 8.0TBps | 1.0× |
+| TDP | 1000W | 1300W | 1.3× |
+
+对应决策框架：
+
+- [第一部分](#decision-framework-part-1--do-you-need-a-new-dtype)很少触发：B300 没有 B200 缺少的数据类型。但显存可能形成能力差距，288 对 180 GiB 增加 1.6×，某些即使并行也装不入 B200 节点的配置，可能直接装入 B300。
+- [第二部分](#decision-framework-part-2--is-it-worth-it-on-performance)：真正计算提升只有 fp4 的 1.5×。bf16／fp8 不变，因此 B300 主要对低精度推理／训练，以及需要更多显存的情况有价值。
+- **软件成熟度风险低。**同属 `sm_100` 架构家族，使用相同 FA4／内核栈，没有跨代升级的“过早切换”成本。
+
+## 复现基准测试
+
+本指南数字来自本目录脚本。原文说明这些数字并非手工录入；下面逐一列出生成表格和图像的脚本，方便复现或换自己的 GPU／模型重测。所有脚本会**自动识别 GPU**，Hopper→FA3、Blackwell→FA4，并在输出头部打印后端和完整环境，因此同一命令可以用于两台机器。
+
+### 文件一览
+
+| 文件 | 用途 | 产出 |
+| --- | --- | --- |
+| `install.sh` | 一次性设置相同 torch／CUDA／依赖，按架构安装 FA3 或 FA4，将模型放到本地盘 | 相同软件栈环境 |
+| `benchmark.py` | 真实权重训练循环，前向+反向+更新，逐步打印 `tflops`、`peak_mem_gib` JSON；顶部配置可被 `SEQ_LEN`、`STEPS`、`WARMUP_STEPS`、`ZERO_STAGE`、`OFFLOAD_OPTIMIZER`、`GRAD_CHECKPOINT`、`USE_LIGER`、`MEM_DEBUG` 覆盖 | 加速和显存表中的一行 |
+| `run_sweep.sh` | 按序列长度列表驱动基准，记录到 `results_<gpu>_<ts>.log` | 加速随长度变化表，以及最大长度／显存表 |
+| `bench_flash_attn.py` | FA3／FA4 独立注意力微基准，扫描序列长度的前向和前向+反向 TFLOPS | 独立注意力数据 |
+| `bench_decompose.py` | 对一个训练步进行分析，以同一墙钟基准分成注意力和其他部分；支持 `SEQ_LEN`、`ZERO_STAGE`、`GRAD_CHECKPOINT`、`OFFLOAD_OPTIMIZER`、`USE_LIGER` | 单步分解表 |
+| `plot_results.py` | 用脚本顶部硬编码的扫描数据生成 matplotlib 图 | `results_plot.png` |
+
+### 第 1 步：每个节点建立相同软件栈
+
+H200 和 B200 运行相同安装脚本，固定相同 torch／CUDA／依赖，预期只让注意力后端不同：Hopper 自动安装 FA3，Blackwell 安装 FA4，并将模型复制到本地盘。
+
+```bash
+./install.sh  # H200 -> FA3, B200 -> FA4 (auto-detected); --force fa3|fa4 to override
+```
+
+`HF_HOME` 默认为 `~/.cache/huggingface`，模型 `meta-llama/Llama-3.1-8B` 必须先下载到那里，例如执行 `hf download meta-llama/Llama-3.1-8B`。安装最后会验证软件栈，并调用一个小型 FA 操作，发现 ABI 不匹配。
+
+### 第 2 步：分别扫描序列长度，生成加速与显存表
+
+```bash
+SEQLENS="8192 32768 65536 131072 196608 262144" GPUS=8 ./run_sweep.sh # -> results_<gpu>_<ts>.log
+```
+
+两台机器都运行。每步打印类似 `{"step": 5, "warmup": false, "exec_time_ms": ..., "tflops": ..., "peak_mem_gib": ...}` 的 JSON。取非预热稳态 `tflops` 生成吞吐量／加速表，取 `peak_mem_gib` 生成显存表。每个长度的 B200/H200 加速比就是两者 TFLOPS 比值。不设环境变量时，默认单一长度 196608、8 块 GPU、10 步加 2 步预热。ZeRO-3、激活检查点、CPU AdamW 卸载、Liger-Kernel、mbs=1 等配置都位于 `benchmark.py` 顶部，并在运行头部打印。
+
+### 第 3 步：独立注意力微基准
+
+```bash
+python bench_flash_attn.py   # prints per-seqlen fwd / fwd+bwd TFLOPS for FA3 or FA4
+```
+
+两台机器都运行。每个长度下 FA4/FA3 的 `fwd_bwd_tflops` 比值就是独立注意力结果，显示注意力约提升 1.9×，说明端到端限制来自稠密路径，而非 FA。
+
+### 第 4 步：分解单步中的注意力与其他部分
+
+```bash
+for L in 0 1; do USE_LIGER=$L deepspeed --num_gpus=8 bench_decompose.py; done  # L=0 base, L=1 Liger
+```
+
+两台机器都运行。先关闭 profiler 测墙钟单步时间，再分析一个窗口，根据计算 stream 的内核耗时占比，将实测时间分给注意力与其他部分。NCCL 与反向重叠，作为隐藏时间排除。两部分来自同一个实测单步，因此必然与总量对齐，得到单步分解表。各部分 B200/H200 比值即其加速比，注意力约 1.87×，稠密路径约 1.67×。
+
+### 第 5 步：显存占用调查，可选
+
+```bash
+MEM_DEBUG=1 SEQ_LEN=32768 deepspeed --num_gpus=8 benchmark.py
+```
+
+`MEM_DEBUG=1` 在前向、反向和更新周围加入 allocated／reserved 探针，并在 rank 0 导出 `torch.cuda.memory._record_memory_history` 快照，有助于[诊断 GPU 显存](../../training/performance/README.md#memory-profiler-tools)。
+
+### 第 6 步：重新绘图
+
+```bash
+python plot_results.py       # -> results_plot.png
+```
+
+注意：`plot_results.py` 的扫描数据**硬编码在顶部**，不会解析 `.log`。重新测试得到不同结果时，应同步修改数组和上面的表格，再生成图像。
+
+## 延伸阅读
+
+- [加速器](../../compute/accelerator/README.md)：各厂商、各数据类型完整规格，MAMF 方法，显存／功耗／频率参考，以及芯片体质和散热说明。
